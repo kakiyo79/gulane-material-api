@@ -209,7 +209,7 @@ def material_add(payload: MaterialAdd, _=Depends(require_key)):
             cover_image, images, goods_count, source_url, publish_date,
             activity_start_date, activity_end_date, address, order_url, ai_group_copy,
             ai_xiaohongshu_copy, ai_moments_copy, review_status, created_at, updated_at
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """,
         (
             payload.category_code, cat_name, payload.title_ja, payload.title_zh,
