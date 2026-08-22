@@ -102,10 +102,14 @@ def init_db():
         )
     """)
     # 迁移：旧表新增字段（兼容已部署实例）
-    try:/n        conn.execute("ALTER TABLE material ADD COLUMN address TEXT DEFAULT ''")
-    except Exception:/n        pass
-    try:/n        conn.execute("ALTER TABLE material ADD COLUMN order_url TEXT DEFAULT ''")
-    except Exception:/n        pass
+    try:
+        conn.execute("ALTER TABLE material ADD COLUMN address TEXT DEFAULT ''")
+    except Exception:
+        pass
+    try:
+        conn.execute("ALTER TABLE material ADD COLUMN order_url TEXT DEFAULT ''")
+    except Exception:
+        pass
     conn.commit()
     conn.close()
 
