@@ -23,6 +23,7 @@ from datetime import datetime, timezone, timedelta
 import requests
 from fastapi import FastAPI, Request, Header, HTTPException, Query, Depends
 from fastapi.responses import JSONResponse, HTMLResponse
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import Optional, List
 
@@ -52,6 +53,15 @@ CAT_CODES = list(CAT_MAP.keys())
 CN_TZ = timezone(timedelta(hours=8))
 
 app = FastAPI(title="谷里GuLane 联动资讯素材库开放接口", version="1.0.0")
+
+# 允许 GitHub Pages / 本地开发等跨域来源访问开放接口
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 # ============================================================
