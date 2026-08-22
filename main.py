@@ -392,6 +392,7 @@ def run_digest():
     return ok(message="digest dispatched")
 
 
+# redeploy trigger: V3 detail page full fields (address/order_url) — 2026-08-23
 if __name__ == "__main__":
     import uvicorn
 
