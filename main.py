@@ -11,15 +11,18 @@
   4. GET  /health                 健康检查
   5. 每日 08:00（北京时）自动汇总当日新增，推送企业微信机器人简报
 
-存储：SQLite（文件 gulane.db），零外部依赖、免费层可跑。
-部署：Render / Railway 免费层（见 render.yaml / Procfile）。
+存储：PostgreSQL（Neon Serverless Postgres，云端持久化，部署不丢数据）。
+      通过环境变量 DATABASE_URL 注入连接串（含密码，不在代码中硬编码）。
+部署：Render（见 render.yaml / Procfile），需配置环境变量 DATABASE_URL。
 """
 import os
-import sqlite3
 import json
 import threading
 from datetime import datetime, timezone, timedelta
+from contextlib import contextmanager
 
+import psycopg2
+import psycopg2.extras
 import requests
 from fastapi import FastAPI, Request, Header, HTTPException, Query, Depends
 from fastapi.responses import JSONResponse, HTMLResponse
@@ -33,11 +36,8 @@ from typing import Optional, List
 X_API_KEY = os.environ.get("X_API_KEY", "")          # 后端分配给爬虫端的固定密钥
 WECOM_WEBHOOK = os.environ.get("WECOM_WEBHOOK", "")  # 企业微信机器人 webhook
 FRONTEND_URL = os.environ.get("FRONTEND_URL", "")    # 前端工作台地址（用于拼接 detail_url）
-DB_PATH = os.environ.get("DB_PATH", os.path.join(os.path.dirname(__file__), "gulane.db"))
-# 持久化目录保障：挂载磁盘（如 Render /data）时目录可能尚未存在，sqlite 不会自动建目录
-_db_dir = os.path.dirname(DB_PATH)
-if _db_dir and not os.path.exists(_db_dir):
-    os.makedirs(_db_dir, exist_ok=True)
+# Neon PostgreSQL 连接串（含密码，由 Render 环境变量注入；本地可 .env 或系统环境变量）
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
 
 # 文档 5 分类枚举（严格对齐）
 CAT_MAP = {
@@ -52,7 +52,7 @@ CAT_CODES = list(CAT_MAP.keys())
 # 北京时区（UTC+8）
 CN_TZ = timezone(timedelta(hours=8))
 
-app = FastAPI(title="谷里GuLane 联动资讯素材库开放接口", version="1.0.0")
+app = FastAPI(title="谷里GuLane 联动资讯素材库开放接口", version="1.1.0")
 
 # 允许 GitHub Pages / 本地开发等跨域来源访问开放接口
 app.add_middleware(
@@ -65,53 +65,70 @@ app.add_middleware(
 
 
 # ============================================================
-# 数据库
+# 数据库（PostgreSQL / Neon）
 # ============================================================
 def get_conn():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
+    """建立一个 psycopg2 连接；失败抛出明确错误便于 Render 日志排查。"""
+    if not DATABASE_URL:
+        raise RuntimeError(
+            "DATABASE_URL 未配置：请在 Render 环境变量中设置 Neon 连接串"
+        )
+    conn = psycopg2.connect(DATABASE_URL, connect_timeout=10, sslmode="require")
+    conn.autocommit = False
     return conn
+
+
+@contextmanager
+def db_cursor():
+    conn = get_conn()
+    try:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        yield cur
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cur.close()
+        conn.close()
 
 
 def init_db():
     conn = get_conn()
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS material (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            category_code TEXT NOT NULL,
-            category_name TEXT,
-            title_ja TEXT DEFAULT '',
-            title_zh TEXT DEFAULT '',
-            content_ja TEXT DEFAULT '',
-            content_zh TEXT DEFAULT '',
-            cover_image TEXT DEFAULT '',
-            images TEXT DEFAULT '',
-            goods_count INTEGER DEFAULT 0,
-            source_url TEXT UNIQUE,
-            publish_date TEXT DEFAULT '',
-            activity_start_date TEXT DEFAULT '',
-            activity_end_date TEXT DEFAULT '',
-            address TEXT DEFAULT '',
-            order_url TEXT DEFAULT '',
-            ai_group_copy TEXT DEFAULT '',
-            ai_xiaohongshu_copy TEXT DEFAULT '',
-            ai_moments_copy TEXT DEFAULT '',
-            review_status TEXT DEFAULT 'pending',
-            created_at TEXT DEFAULT '',
-            updated_at TEXT DEFAULT ''
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS material (
+                id SERIAL PRIMARY KEY,
+                category_code TEXT NOT NULL,
+                category_name TEXT,
+                title_ja TEXT DEFAULT '',
+                title_zh TEXT DEFAULT '',
+                content_ja TEXT DEFAULT '',
+                content_zh TEXT DEFAULT '',
+                cover_image TEXT DEFAULT '',
+                images TEXT DEFAULT '',
+                goods_count INTEGER DEFAULT 0,
+                source_url TEXT UNIQUE,
+                publish_date TEXT DEFAULT '',
+                activity_start_date TEXT DEFAULT '',
+                activity_end_date TEXT DEFAULT '',
+                address TEXT DEFAULT '',
+                order_url TEXT DEFAULT '',
+                ai_group_copy TEXT DEFAULT '',
+                ai_xiaohongshu_copy TEXT DEFAULT '',
+                ai_moments_copy TEXT DEFAULT '',
+                review_status TEXT DEFAULT 'pending',
+                created_at TEXT DEFAULT '',
+                updated_at TEXT DEFAULT ''
+            )
+            """
         )
-    """)
-    # 迁移：旧表新增字段（兼容已部署实例）
-    try:
-        conn.execute("ALTER TABLE material ADD COLUMN address TEXT DEFAULT ''")
-    except Exception:
-        pass
-    try:
-        conn.execute("ALTER TABLE material ADD COLUMN order_url TEXT DEFAULT ''")
-    except Exception:
-        pass
-    conn.commit()
-    conn.close()
+        conn.commit()
+    finally:
+        cur.close()
+        conn.close()
 
 
 init_db()
@@ -183,10 +200,8 @@ def health():
 # 临时管理接口：清空素材库（部署期清理脏数据用）
 @app.post("/_admin/clear-materials")
 def admin_clear_materials(_=Depends(require_key)):
-    conn = get_conn()
-    conn.execute("DELETE FROM material")
-    conn.commit()
-    conn.close()
+    with db_cursor() as cur:
+        cur.execute("DELETE FROM material")
     return ok({"cleared": True}, message="素材库已清空")
 
 
@@ -199,42 +214,50 @@ def material_add(payload: MaterialAdd, _=Depends(require_key)):
         return fail(400, "source_url 不能为空（作为幂等键）")
 
     conn = get_conn()
-    # 幂等：source_url 唯一（文档 5.2）
-    exist = conn.execute(
-        "SELECT id FROM material WHERE source_url=?", (payload.source_url,)
-    ).fetchone()
-    if exist:
-        conn.close()
-        mid = exist["id"]
-        return ok(
-            {"material_id": mid, "detail_url": detail_url(mid), "duplicate": True},
-            message="source_url 已存在，未重复入库",
+    try:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        # 幂等：source_url 唯一（文档 5.2）
+        cur.execute(
+            "SELECT id FROM material WHERE source_url=%s", (payload.source_url,)
         )
+        exist = cur.fetchone()
+        if exist:
+            mid = exist["id"]
+            return ok(
+                {"material_id": mid, "detail_url": detail_url(mid), "duplicate": True},
+                message="source_url 已存在，未重复入库",
+            )
 
-    cat_name = CAT_MAP.get(payload.category_code, "")
-    cur = conn.execute(
-        """
-        INSERT INTO material (
-            category_code, category_name, title_ja, title_zh, content_ja, content_zh,
-            cover_image, images, goods_count, source_url, publish_date,
-            activity_start_date, activity_end_date, address, order_url, ai_group_copy,
-            ai_xiaohongshu_copy, ai_moments_copy, review_status, created_at, updated_at
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-        """,
-        (
-            payload.category_code, cat_name, payload.title_ja, payload.title_zh,
-            payload.content_ja, payload.content_zh, payload.cover_image, payload.images,
-            payload.goods_count or 0, payload.source_url, payload.publish_date,
-            payload.activity_start_date, payload.activity_end_date,
-            payload.address or "", payload.order_url or "",
-            payload.ai_group_copy, payload.ai_xiaohongshu_copy, payload.ai_moments_copy,
-            "pending", now_cn(), now_cn(),
-        ),
-    )
-    mid = cur.lastrowid
-    conn.commit()
-    conn.close()
-    return ok({"material_id": mid, "detail_url": detail_url(mid)}, message="入库成功")
+        cat_name = CAT_MAP.get(payload.category_code, "")
+        cur.execute(
+            """
+            INSERT INTO material (
+                category_code, category_name, title_ja, title_zh, content_ja, content_zh,
+                cover_image, images, goods_count, source_url, publish_date,
+                activity_start_date, activity_end_date, address, order_url, ai_group_copy,
+                ai_xiaohongshu_copy, ai_moments_copy, review_status, created_at, updated_at
+            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            RETURNING id
+            """,
+            (
+                payload.category_code, cat_name, payload.title_ja, payload.title_zh,
+                payload.content_ja, payload.content_zh, payload.cover_image, payload.images,
+                payload.goods_count or 0, payload.source_url, payload.publish_date,
+                payload.activity_start_date, payload.activity_end_date,
+                payload.address or "", payload.order_url or "",
+                payload.ai_group_copy, payload.ai_xiaohongshu_copy, payload.ai_moments_copy,
+                "pending", now_cn(), now_cn(),
+            ),
+        )
+        mid = cur.fetchone()["id"]
+        conn.commit()
+        return ok({"material_id": mid, "detail_url": detail_url(mid)}, message="入库成功")
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cur.close()
+        conn.close()
 
 
 @app.get("/api/open/material")
@@ -244,22 +267,21 @@ def material_list(
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
 ):
-    conn = get_conn()
-    # 过滤掉爬虫写入的脏数据（无中文标题/无封面图），只展示可运营的素材
-    where = "WHERE title_zh IS NOT NULL AND title_zh != '' AND cover_image IS NOT NULL AND cover_image != ''"
+    where = "WHERE title_zh IS NOT NULL AND title_zh <> '' AND cover_image IS NOT NULL AND cover_image <> ''"
     args = []
     if category:
         if category not in CAT_CODES:
-            conn.close()
             return fail(400, "category 必须是 %s 之一" % "/".join(CAT_CODES))
-        where += " AND category_code=?"
+        where += " AND category_code=%s"
         args.append(category)
-    total = conn.execute("SELECT COUNT(*) c FROM material " + where, args).fetchone()["c"]
-    rows = conn.execute(
-        "SELECT * FROM material " + where + " ORDER BY id DESC LIMIT ? OFFSET ?",
-        args + [size, (page - 1) * size],
-    ).fetchall()
-    conn.close()
+    with db_cursor() as cur:
+        cur.execute("SELECT COUNT(*) c FROM material " + where, args)
+        total = cur.fetchone()["c"]
+        cur.execute(
+            "SELECT * FROM material " + where + " ORDER BY id DESC LIMIT %s OFFSET %s",
+            args + [size, (page - 1) * size],
+        )
+        rows = cur.fetchall()
     items = [dict(r) for r in rows]
     return ok({"total": total, "page": page, "size": size, "items": items})
 
@@ -283,16 +305,13 @@ def material_cleanup(
         datetime.strptime(cutoff, "%Y-%m-%d")
     except ValueError:
         return fail(400, "cutoff 格式应为 YYYY-MM-DD")
-    conn = get_conn()
-    # 仅清理有活动结束日且结束日 < cutoff 的记录
-    cur = conn.execute(
-        "DELETE FROM material WHERE activity_end_date IS NOT NULL "
-        "AND activity_end_date <> '' AND activity_end_date < ?",
-        (cutoff,),
-    )
-    deleted = cur.rowcount
-    conn.commit()
-    conn.close()
+    with db_cursor() as cur:
+        cur.execute(
+            "DELETE FROM material WHERE activity_end_date IS NOT NULL "
+            "AND activity_end_date <> '' AND activity_end_date < %s",
+            (cutoff,),
+        )
+        deleted = cur.rowcount
     return ok({"deleted": deleted, "cutoff": cutoff, "message": "已清理 %d 条过期活动素材" % deleted})
 
 
@@ -313,8 +332,13 @@ def material_detail(mid: int):
             % (FRONTEND_URL, mid)
         )
     conn = get_conn()
-    row = conn.execute("SELECT * FROM material WHERE id=?", (mid,)).fetchone()
-    conn.close()
+    try:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute("SELECT * FROM material WHERE id=%s", (mid,))
+        row = cur.fetchone()
+    finally:
+        cur.close()
+        conn.close()
     if not row:
         return HTMLResponse("<h1>素材不存在</h1>", status_code=404)
     r = dict(row)
@@ -331,12 +355,12 @@ def material_detail(mid: int):
 # ============================================================
 def build_daily_digest():
     today = today_cn()
-    conn = get_conn()
-    rows = conn.execute(
-        "SELECT category_code, COUNT(*) c FROM material WHERE created_at LIKE ? GROUP BY category_code",
-        (today + "%",),
-    ).fetchall()
-    conn.close()
+    with db_cursor() as cur:
+        cur.execute(
+            "SELECT category_code, COUNT(*) c FROM material WHERE created_at LIKE %s GROUP BY category_code",
+            (today + "%",),
+        )
+        rows = cur.fetchall()
     if not rows:
         return None
     total = sum(r["c"] for r in rows)
@@ -407,7 +431,7 @@ def run_digest():
     return ok(message="digest dispatched")
 
 
-# redeploy trigger: V3 detail page full fields (address/order_url) — 2026-08-23
+# storage migrated to Neon PostgreSQL (2026-08-23)
 if __name__ == "__main__":
     import uvicorn
 
