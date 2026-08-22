@@ -245,7 +245,8 @@ def material_list(
     size: int = Query(20, ge=1, le=100),
 ):
     conn = get_conn()
-    where = "WHERE 1=1"
+    # 过滤掉爬虫写入的脏数据（无中文标题/无封面图），只展示可运营的素材
+    where = "WHERE title_zh IS NOT NULL AND title_zh != '' AND cover_image IS NOT NULL AND cover_image != ''"
     args = []
     if category:
         if category not in CAT_CODES:
