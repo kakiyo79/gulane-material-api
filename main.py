@@ -33,6 +33,10 @@ X_API_KEY = os.environ.get("X_API_KEY", "")          # 后端分配给爬虫端�
 WECOM_WEBHOOK = os.environ.get("WECOM_WEBHOOK", "")  # 企业微信机器人 webhook
 FRONTEND_URL = os.environ.get("FRONTEND_URL", "")    # 前端工作台地址（用于拼接 detail_url）
 DB_PATH = os.environ.get("DB_PATH", os.path.join(os.path.dirname(__file__), "gulane.db"))
+# 持久化目录保障：挂载磁盘（如 Render /data）时目录可能尚未存在，sqlite 不会自动建目录
+_db_dir = os.path.dirname(DB_PATH)
+if _db_dir and not os.path.exists(_db_dir):
+    os.makedirs(_db_dir, exist_ok=True)
 
 # 文档 5 分类枚举（严格对齐）
 CAT_MAP = {
@@ -223,6 +227,38 @@ def material_list(
     conn.close()
     items = [dict(r) for r in rows]
     return ok({"total": total, "page": page, "size": size, "items": items})
+
+
+@app.post("/api/open/material/cleanup")
+def material_cleanup(
+    _=Depends(require_key),
+    cutoff: Optional[str] = Query(None, description="过期判定日，格式 YYYY-MM-DD，默认今天（活动结束日 < 该日期即清理）"),
+):
+    """活动过期自动清理：删除 activity_end_date 非空且早于 cutoff 的素材。
+
+    设计原则（与用户约定一致）：
+    - 只有「活动结束日已过期」的才清理；没有活动结束日的纯文章/周边长期保留。
+    - cutoff 默认今天；爬虫侧调用时可传统一时间，保证前后端判定一致。
+    - 满足「所有数据先保存，过期才清理」：入库不丢，仅过期删除。
+    """
+    if not cutoff:
+        cutoff = today_cn()
+    # 简单校验格式
+    try:
+        datetime.strptime(cutoff, "%Y-%m-%d")
+    except ValueError:
+        return fail(400, "cutoff 格式应为 YYYY-MM-DD")
+    conn = get_conn()
+    # 仅清理有活动结束日且结束日 < cutoff 的记录
+    cur = conn.execute(
+        "DELETE FROM material WHERE activity_end_date IS NOT NULL "
+        "AND activity_end_date <> '' AND activity_end_date < ?",
+        (cutoff,),
+    )
+    deleted = cur.rowcount
+    conn.commit()
+    conn.close()
+    return ok({"deleted": deleted, "cutoff": cutoff, "message": "已清理 %d 条过期活动素材" % deleted})
 
 
 def detail_url(mid):

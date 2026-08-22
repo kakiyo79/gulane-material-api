@@ -5,6 +5,11 @@ services:
     plan: free
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    # 持久化磁盘：免费层临时文件系统会在冷启动/重启时清空数据，挂载磁盘后数据可长期保留
+    disk:
+      name: gulane-data
+      mountPath: /data
+      sizeGB: 1
     envVars:
       - key: X_API_KEY
         sync: false
@@ -12,3 +17,5 @@ services:
         sync: false
       - key: FRONTEND_URL
         sync: false
+      - key: DB_PATH
+        value: /data/gulane.db
