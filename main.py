@@ -180,6 +180,16 @@ def health():
     return {"code": 0, "message": "ok", "data": {"time": now_cn()}}
 
 
+# 临时管理接口：清空素材库（部署期清理脏数据用）
+@app.post("/_admin/clear-materials")
+def admin_clear_materials(_=Depends(require_key)):
+    conn = get_conn()
+    conn.execute("DELETE FROM material")
+    conn.commit()
+    conn.close()
+    return ok({"cleared": True}, message="素材库已清空")
+
+
 @app.post("/api/open/material/add")
 def material_add(payload: MaterialAdd, _=Depends(require_key)):
     # 分类枚举校验
