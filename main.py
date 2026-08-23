@@ -119,6 +119,8 @@ def init_db():
                 ai_group_copy TEXT DEFAULT '',
                 ai_xiaohongshu_copy TEXT DEFAULT '',
                 ai_moments_copy TEXT DEFAULT '',
+                points_ja TEXT DEFAULT '',
+                points_zh TEXT DEFAULT '',
                 review_status TEXT DEFAULT 'pending',
                 created_at TEXT DEFAULT '',
                 updated_at TEXT DEFAULT ''
@@ -131,7 +133,24 @@ def init_db():
         conn.close()
 
 
-init_db()
+def migrate_db():
+    """自动追加新增字段（向后兼容已创建的表）。"""
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT column_name FROM information_schema.columns WHERE table_name='material'")
+        cols = {row[0] for row in cur.fetchall()}
+        for col, dtype in [("points_ja", "TEXT DEFAULT ''"), ("points_zh", "TEXT DEFAULT ''")]:
+            if col not in cols:
+                cur.execute(f"ALTER TABLE material ADD COLUMN {col} {dtype}")
+                conn.commit()
+                print(f"[migrate] added column {col}")
+    finally:
+        cur.close()
+        conn.close()
+
+
+migrate_db()
 
 
 def now_cn():
@@ -182,6 +201,8 @@ class MaterialAdd(BaseModel):
     ai_group_copy: Optional[str] = ""
     ai_xiaohongshu_copy: Optional[str] = ""
     ai_moments_copy: Optional[str] = ""
+    points_ja: Optional[str] = ""
+    points_zh: Optional[str] = ""
 
 
 # ============================================================
@@ -223,6 +244,32 @@ def material_add(payload: MaterialAdd, _=Depends(require_key)):
         exist = cur.fetchone()
         if exist:
             mid = exist["id"]
+            # 如果已存在但 points 为空，且本次传入非空 points，则自动回填
+            should_update = False
+            update_fields = []
+            update_vals = []
+            if (payload.points_ja or payload.points_zh):
+                cur.execute("SELECT points_ja, points_zh FROM material WHERE id=%s", (mid,))
+                row = cur.fetchone()
+                if row and not (row["points_ja"] or "").strip() and payload.points_ja:
+                    update_fields.append("points_ja=%s")
+                    update_vals.append(payload.points_ja)
+                    should_update = True
+                if row and not (row["points_zh"] or "").strip() and payload.points_zh:
+                    update_fields.append("points_zh=%s")
+                    update_vals.append(payload.points_zh)
+                    should_update = True
+            if should_update:
+                update_vals.extend([now_cn(), mid])
+                cur.execute(
+                    "UPDATE material SET " + ", ".join(update_fields) + ", updated_at=%s WHERE id=%s",
+                    update_vals,
+                )
+                conn.commit()
+                return ok(
+                    {"material_id": mid, "detail_url": detail_url(mid), "updated": True},
+                    message="source_url 已存在，已回填要点",
+                )
             return ok(
                 {"material_id": mid, "detail_url": detail_url(mid), "duplicate": True},
                 message="source_url 已存在，未重复入库",
@@ -235,8 +282,8 @@ def material_add(payload: MaterialAdd, _=Depends(require_key)):
                 category_code, category_name, title_ja, title_zh, content_ja, content_zh,
                 cover_image, images, goods_count, source_url, publish_date,
                 activity_start_date, activity_end_date, address, order_url, ai_group_copy,
-                ai_xiaohongshu_copy, ai_moments_copy, review_status, created_at, updated_at
-            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                ai_xiaohongshu_copy, ai_moments_copy, points_ja, points_zh, review_status, created_at, updated_at
+            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
             RETURNING id
             """,
             (
@@ -246,6 +293,7 @@ def material_add(payload: MaterialAdd, _=Depends(require_key)):
                 payload.activity_start_date, payload.activity_end_date,
                 payload.address or "", payload.order_url or "",
                 payload.ai_group_copy, payload.ai_xiaohongshu_copy, payload.ai_moments_copy,
+                payload.points_ja or "", payload.points_zh or "",
                 "pending", now_cn(), now_cn(),
             ),
         )
